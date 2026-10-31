@@ -147,7 +147,89 @@ By default, NetBox will prevent the creation of duplicate prefixes and IP addres
 
 Default: `['extras.events.process_event_queue',]`
 
-NetBox will call dotted paths to the functions listed here for events (create, update, delete) on models as well as when custom EventRules are fired.
+A list of dotted Python paths to callable handlers. After a request or job finishes successfully, NetBox flushes the in-memory event queue and calls each handler in list order, passing the queued events. If `extras.events.process_event_queue` is omitted from this list, NetBox inserts it at the start of the pipeline so [event rules](../features/event-rules.md) still run. Plugin `events_pipeline` entries are appended.
+
+Handlers are invoked only when the request or job completes without raising. Events queued during a failed request or job are discarded.
+
+### Handler signature
+
+Each handler must accept a single argument: the list of queued events.
+
+```python
+def handle_events(events):
+    for event in events:
+        ...
+```
+
+Return values are ignored. Handlers run in the same process as the originating request or job, after the wrapped view or job body has returned.
+
+### Event objects
+
+Each item is an `EventContext` (`extras.events.EventContext`), a dictionary-compatible wrapper. Object create/update/delete events include these keys:
+
+| Key | Description |
+|-----|-------------|
+| `object_type` | `ObjectType` for the changed model |
+| `object_id` | Primary key of the instance |
+| `object` | The model instance. On coalesced updates this remains the first instance that was queued; later saves refresh only the serialization source used for `data`. |
+| `event_type` | Event type (for example create, update, or delete) |
+| `snapshots` | Dict with `prechange` and `postchange` snapshots. A later event for the same object updates `postchange`. For a delete, `postchange` is `None`. |
+| `object_change_ids` | List of `ObjectChange` IDs recorded for this object during the request. Repeated events for the same object append distinct IDs. |
+| `request` | The current request |
+| `user` | `request.user` |
+| `data` | Serialized object payload (see below) |
+
+Repeated events for the same object (`<app>.<model>:<pk>`) are combined into one queue entry. A later delete promotes a prior create/update to a delete event.
+
+Objects that do not support event rules are not queued.
+
+### Serialization of `data`
+
+`data` is produced by the model's REST API serializer (`request` context is `None`). It is **not** the same as the retained `object` instance.
+
+- For create and update events, `data` is serialized on first access. If the same object is queued again, any cached `data` is dropped and the next access serializes the latest queued instance.
+- For delete events, `data` is serialized immediately when the event is queued, before the row (and related data) may become inaccessible.
+
+### Passing data to background workers
+
+The default handler (`process_event_queue`) evaluates event rules and enqueues webhook and script work. Those actions pass `data` and `snapshots` into RQ. When a request is present, they copy it with `copy_safe_request(request, include_files=False)` so uploaded files are not pickled (which can fail for some file types). Custom handlers that enqueue jobs should do the same if they need request context.
+
+Job start/complete event rules are processed directly from job signals and do not go through `EVENTS_PIPELINE`. Those events may omit `request` and use the job's `data` field as the payload.
+
+### Exceptions
+
+If a handler path cannot be imported, NetBox logs an `ImportError` and continues with the next handler. Any other exception raised by a handler is not caught: it propagates and can fail the request or job after the originating database changes have already been saved.
+
+### Example
+
+```python
+# configuration.py
+EVENTS_PIPELINE = [
+    'extras.events.process_event_queue',
+    'my_plugin.events.log_object_events',
+]
+```
+
+```python
+# my_plugin/events.py
+import logging
+
+logger = logging.getLogger('netbox.events_processor')
+
+
+def log_object_events(events):
+    for event in events:
+        logger.info(
+            'event %s for %s pk=%s (changes=%s)',
+            event['event_type'],
+            event['object_type'],
+            event['object_id'],
+            event['object_change_ids'],
+        )
+        # Accessing event['data'] serializes the object (already done for deletes).
+        payload = event['data']
+        snapshots = event['snapshots']
+```
 
 ---
 
